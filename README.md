@@ -1,5 +1,7 @@
 # proxyctl
 
+[English](README.md) | [Русский](README.ru.md)
+
 `proxyctl` is a Bash CLI/TUI for operating a personal or small-scale Dante SOCKS5 proxy on Ubuntu.
 
 It wraps the routine administration tasks that usually end up scattered across `systemctl`, `ufw`, `journalctl`, `passwd`, and direct edits to `/etc/danted.conf`.
