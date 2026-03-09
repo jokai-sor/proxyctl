@@ -332,13 +332,39 @@ ui_width_init() {
   UI_WIDTH="$w"
 }
 
+ui_fit_text() {
+  local text="$1"
+  local max="$2"
+  python3 - "$text" "$max" <<'PY'
+import sys
+import unicodedata
+
+text = sys.argv[1]
+limit = int(sys.argv[2])
+width = 0
+out = []
+
+for ch in text:
+    if unicodedata.combining(ch):
+        ch_width = 0
+    elif unicodedata.east_asian_width(ch) in ("W", "F"):
+        ch_width = 2
+    else:
+        ch_width = 1
+    if width + ch_width > limit:
+        break
+    out.append(ch)
+    width += ch_width
+
+sys.stdout.write("".join(out))
+sys.stdout.write(" " * max(0, limit - width))
+PY
+}
+
 ui_block_line() {
   local text="$1"
   local max=$((UI_WIDTH - 4))
-  if ((${#text} > max)); then
-    text="${text:0:max}"
-  fi
-  printf "| %-*s |\n" "$max" "$text"
+  printf "| %s |\n" "$(ui_fit_text "$text" "$max")"
 }
 
 ui_box_open() {
