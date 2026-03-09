@@ -1,0 +1,10 @@
+[Unit]
+Description=Run proxyctl quota enforcement daily
+
+[Timer]
+OnCalendar=*-*-* 00:10:00
+Persistent=true
+Unit=proxyctl-quota-enforce.service
+
+[Install]
+WantedBy=timers.target

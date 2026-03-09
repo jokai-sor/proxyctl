@@ -1,0 +1,10 @@
+[Unit]
+Description=Proxyctl quota enforcement
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl quota enforce
+User=root
+Group=root

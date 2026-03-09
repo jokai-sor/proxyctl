@@ -6,6 +6,11 @@ DANTED_SERVICE="danted"
 DANTED_CONF="/etc/danted.conf"
 PROXYCTL_LANG_FILE="/etc/proxyctl/lang"
 PROXYCTL_QUOTA_FILE="/etc/proxyctl/quotas.conf"
+PROXYCTL_CACHE_DIR="/etc/proxyctl/cache"
+PROXYCTL_BACKUP_DIR="/etc/proxyctl/backups"
+PAM_DANTED_FILE="/etc/pam.d/danted"
+FAIL2BAN_DANTED_FILTER="/etc/fail2ban/filter.d/danted-auth.conf"
+FAIL2BAN_DANTED_JAIL="/etc/fail2ban/jail.d/danted.local"
 LANG_CODE="en"
 UI_COLOR=1
 UI_WIDTH=88
@@ -415,6 +420,113 @@ match_lines() {
   fi
 }
 
+default_iface() {
+  ip route show default 2>/dev/null | awk 'NR == 1 {print $5}'
+}
+
+timestamp_now() {
+  date +%F-%H%M%S
+}
+
+ensure_runtime_dirs() {
+  mkdir -p "$PROXYCTL_CACHE_DIR" "$PROXYCTL_BACKUP_DIR"
+}
+
+backup_file_if_exists() {
+  local path="$1"
+  [[ -f "$path" ]] || return 0
+  ensure_runtime_dirs
+  local sanitized ts backup
+  sanitized="$(sed 's|/|_|g' <<< "$path" | sed 's|^_||')"
+  ts="$(timestamp_now)"
+  backup="${PROXYCTL_BACKUP_DIR}/${sanitized}.${ts}.bak"
+  cp "$path" "$backup"
+  echo "backup: $backup"
+}
+
+write_managed_file() {
+  local path="$1"
+  local content="$2"
+  local tmp
+  tmp="$(mktemp)"
+  printf "%s\n" "$content" > "$tmp"
+  mkdir -p "$(dirname "$path")"
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    rm -f "$tmp"
+    echo "unchanged: $path"
+    return
+  fi
+  backup_file_if_exists "$path"
+  install -m 0644 "$tmp" "$path"
+  rm -f "$tmp"
+  echo "written: $path"
+}
+
+render_bootstrap_danted_conf() {
+  local iface="$1"
+  local port="$2"
+  local udp_range="$3"
+  cat <<EOF
+logoutput: syslog
+internal: ${iface} port = ${port}
+external: ${iface}
+
+socksmethod: pam.username
+user.privileged: root
+user.unprivileged: nobody
+user.libwrap: nobody
+
+client pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  log: error connect disconnect
+}
+
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  group: ${PROXY_GROUP}
+  command: connect udpassociate
+  udp.portrange: ${udp_range}
+  log: error connect disconnect ioop
+}
+EOF
+}
+
+render_bootstrap_pam_danted() {
+  cat <<EOF
+# Restrict Dante auth to members of ${PROXY_GROUP}
+# Order matters: group check + standard auth/account stacks
+auth required pam_succeed_if.so user ingroup ${PROXY_GROUP}
+auth include common-auth
+
+account required pam_succeed_if.so user ingroup ${PROXY_GROUP}
+account include common-account
+EOF
+}
+
+render_bootstrap_fail2ban_filter() {
+  cat <<'EOF'
+[Definition]
+failregex = pam_unix\(danted:auth\): authentication failure;.*rhost=<HOST>
+ignoreregex =
+EOF
+}
+
+render_bootstrap_fail2ban_jail() {
+  local port="$1"
+  cat <<EOF
+[danted-auth]
+enabled = true
+filter = danted-auth
+port = ${port}
+logpath = /var/log/auth.log
+backend = auto
+findtime = 10m
+maxretry = 6
+bantime = 1h
+action = ufw[name=danted-auth, port="${port}", protocol=tcp]
+EOF
+}
+
 print_main_help() {
   cat <<'HELP'
 proxyctl - CLI for Dante SOCKS5 management
@@ -423,6 +535,7 @@ Usage:
   proxyctl <group> <command> [options]
 
 Command groups:
+  bootstrap   Install and configure Dante stack on a clean server
   service     Manage danted service and logs
   user        Manage SOCKS users
   firewall    Manage UFW rules for SOCKS port
@@ -435,6 +548,7 @@ Command groups:
   help        Show this help
 
 Examples:
+  sudo proxyctl bootstrap --proxy-password-random
   sudo proxyctl service status
   sudo proxyctl user add alice --random
   sudo proxyctl firewall allow-ip 203.0.113.10
@@ -449,6 +563,29 @@ Legacy aliases (still supported):
   status restart logs connections show-config ufw-status
   list-users adopt-user add-user set-password lock unlock del-user
   allow-ip revoke-ip
+HELP
+}
+
+print_bootstrap_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl bootstrap [options]
+
+Options:
+  --iface <name>                 Outbound interface (default: auto-detect)
+  --port <port>                  SOCKS5 TCP port (default: 1080)
+  --udp-range <start-end>        UDP relay port range (default: 20000-20100)
+  --proxy-user <username>        Initial proxy user (default: proxy-user)
+  --proxy-password <password>    Set initial proxy password
+  --proxy-password-random        Generate initial proxy password
+  --reset-password               Reset password if proxy user already exists
+  --format <generic|telegram|uri>
+                                 Access output format (default: generic)
+  --allow-ip <ip-or-cidr>        Restrict SOCKS access to this source (repeatable)
+  --public                       Open SOCKS port publicly if no allow-ip rules are given
+  --skip-fail2ban                Do not install/configure fail2ban for Dante
+  --skip-ufw                     Do not touch UFW rules
+  --dry-run                      Print intended actions without changing the system
 HELP
 }
 
@@ -471,6 +608,7 @@ print_usage_help() {
   cat <<'HELP'
 Usage:
   proxyctl usage [--since "YYYY-MM-01 00:00:00"] [--user <username>]
+  proxyctl usage --warm-cache
 
 Defaults:
   --since = first day of current month (UTC)
@@ -551,24 +689,142 @@ gb_to_bytes() {
   awk -v g="$gb" 'BEGIN{printf "%.0f", g*1024*1024*1024}'
 }
 
+month_key_utc() {
+  date -u +"%Y-%m"
+}
+
+month_start_epoch_utc() {
+  date -u -d "$(month_start_utc)" +%s
+}
+
+usage_cache_file() {
+  echo "${PROXYCTL_CACHE_DIR}/usage-$(month_key_utc).db"
+}
+
+usage_cache_init() {
+  mkdir -p "$PROXYCTL_CACHE_DIR"
+}
+
+usage_cache_refresh_month() {
+  usage_cache_init
+
+  local cache_file month_start month_epoch last_ts tmp merge_tmp
+  cache_file="$(usage_cache_file)"
+  month_start="$(month_start_utc)"
+  month_epoch="$(month_start_epoch_utc)"
+  last_ts="$month_epoch"
+
+  if [[ -f "$cache_file" ]]; then
+    local cached_ts
+    cached_ts="$(sed -n 's/^__last_ts=//p' "$cache_file" | head -n1)"
+    if [[ "$cached_ts" =~ ^[0-9]+$ ]] && (( cached_ts >= month_epoch )); then
+      last_ts="$cached_ts"
+    fi
+  fi
+
+  tmp="$(mktemp)"
+  merge_tmp="$(mktemp)"
+  trap 'rm -f "${tmp:-}" "${merge_tmp:-}"' RETURN
+
+  journalctl -u "$DANTED_SERVICE" --since "@${last_ts}" --grep 'tcp/connect \]:' --output=short-unix --no-pager 2>/dev/null \
+    | perl -ne '
+        next unless /^([0-9]+(?:\.[0-9]+)?)\s+/;
+        my $ts = int($1);
+        next if $ts <= '"$last_ts"';
+        if (/username%([^@ ]+)@.*->\s*([0-9]+),\s*([0-9]+)\s*->/) {
+          $sum{$1} += ($2 + $3);
+          $max_ts = $ts if !defined($max_ts) || $ts > $max_ts;
+        }
+        END {
+          for my $user (keys %sum) {
+            print $user, " ", $sum{$user}, "\n";
+          }
+          print "__max_ts ", $max_ts, "\n" if defined $max_ts;
+        }
+      ' > "$tmp"
+
+  if [[ ! -s "$cache_file" ]]; then
+    printf "__last_ts=%s\n" "$last_ts" > "$cache_file"
+  fi
+
+  awk '$1 != "__max_ts" && NF >= 2 {print $1, $2}' "$tmp" > "$merge_tmp"
+  if [[ -s "$merge_tmp" ]]; then
+    awk '
+      FNR == NR {
+        if ($1 == "__last_ts=") next
+        if ($1 !~ /^__last_ts=/ && NF >= 2) sum[$1] = $2
+        next
+      }
+      NF >= 2 { sum[$1] += $2 }
+      END {
+        for (user in sum) printf "%s %d\n", user, sum[user]
+      }
+    ' "$cache_file" "$merge_tmp" | sort > "${cache_file}.rows"
+  else
+    awk '$1 !~ /^__last_ts=/ && NF >= 2 {print $1, $2}' "$cache_file" | sort > "${cache_file}.rows"
+  fi
+
+  local new_last_ts
+  new_last_ts="$(awk '$1 == "__max_ts" {print $2}' "$tmp" | tail -n1)"
+  if [[ ! "$new_last_ts" =~ ^[0-9]+$ ]]; then
+    new_last_ts="$last_ts"
+  fi
+
+  {
+    printf "__last_ts=%s\n" "$new_last_ts"
+    cat "${cache_file}.rows"
+  } > "${cache_file}.new"
+  mv "${cache_file}.new" "$cache_file"
+  rm -f "${cache_file}.rows"
+}
+
+usage_rows_cached_month() {
+  usage_cache_refresh_month
+  local cache_file
+  cache_file="$(usage_cache_file)"
+  awk '$1 !~ /^__last_ts=/ && NF >= 2 {print $1, $2}' "$cache_file"
+}
+
+usage_warm_cache() {
+  need_root
+  usage_cache_refresh_month
+  local cache_file
+  cache_file="$(usage_cache_file)"
+  echo "[usage-cache]"
+  echo "month: $(month_key_utc)"
+  echo "file: $cache_file"
+  if [[ -f "$cache_file" ]]; then
+    sed -n 's/^__last_ts=/last_ts=/p' "$cache_file" | head -n1
+    echo "entries: $(awk '$1 !~ /^__last_ts=/ && NF >= 2 {n++} END {print n+0}' "$cache_file")"
+  fi
+}
+
 usage_rows() {
   local since="$1"
-  journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager \
-    | match_lines "tcp/connect \\]:" \
+  if [[ "$since" == "$(month_start_utc)" ]]; then
+    usage_rows_cached_month
+    return
+  fi
+  journalctl -u "$DANTED_SERVICE" --since "$since" --grep 'tcp/connect \]:' --output=cat --no-pager 2>/dev/null \
     | perl -ne '
         if (/username%([^@ ]+)@.*->\s*([0-9]+),\s*([0-9]+)\s*->/) {
-          print "$1 ", ($2+$3), "\n";
+          $sum{$1} += ($2 + $3);
+        }
+        END {
+          for my $user (keys %sum) {
+            print $user, " ", $sum{$user}, "\n";
+          }
         }
       ' \
-    | awk '{s[$1]+=$2} END {for (u in s) printf "%s %d\n", u, s[u]}' \
     | sort
 }
 
 usage() {
   need_root
-  local since user
+  local since user warm_cache
   since="$(month_start_utc)"
   user=""
+  warm_cache="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -582,6 +838,9 @@ usage() {
         [[ $# -gt 0 ]] || err "--user requires a value"
         user="$1"
         ;;
+      --warm-cache)
+        warm_cache="true"
+        ;;
       -h|--help)
         print_usage_help
         return
@@ -592,6 +851,11 @@ usage() {
     esac
     shift
   done
+
+  if [[ "$warm_cache" == "true" ]]; then
+    usage_warm_cache
+    return
+  fi
 
   local rows
   rows="$(usage_rows "$since" || true)"
@@ -791,6 +1055,209 @@ set_password() {
   echo "${user}:${pass}" | chpasswd
   echo "username: ${user}"
   echo "password: ${pass}"
+}
+
+bootstrap_user_ensure() {
+  local user="$1"
+  local password="$2"
+  local reset_existing="$3"
+  local fmt="$4"
+  local host port
+  host="$(proxy_host || true)"
+  [[ -n "$host" ]] || host="unknown"
+  port="$(proxy_port)"
+  ensure_group
+
+  if id "$user" >/dev/null 2>&1; then
+    usermod -aG "$PROXY_GROUP" "$user"
+    if [[ "$reset_existing" == "true" ]]; then
+      [[ -n "$password" ]] || password="$(random_password)"
+      echo "${user}:${password}" | chpasswd
+      print_access_data "$user" "$password" "$host" "$port" "$fmt"
+    else
+      echo "user exists: $user"
+    fi
+    return
+  fi
+
+  [[ -n "$password" ]] || password="$(random_password)"
+  useradd -M -s /usr/sbin/nologin -G "$PROXY_GROUP" "$user"
+  echo "${user}:${password}" | chpasswd
+  print_access_data "$user" "$password" "$host" "$port" "$fmt"
+}
+
+bootstrap_configure_ufw() {
+  local port="$1"
+  local udp_range="$2"
+  shift 2
+  local ufw_udp_range cidr
+  local -a allow_ips=( "$@" )
+  ufw_udp_range="${udp_range/-/:}"
+
+  if (( ${#allow_ips[@]} > 0 )); then
+    for cidr in "${allow_ips[@]}"; do
+      ufw allow from "$cidr" to any port "$port" proto tcp >/dev/null || true
+      ufw allow from "$cidr" to any port "$ufw_udp_range" proto udp >/dev/null || true
+      echo "ufw allow: $cidr -> tcp/$port udp/$ufw_udp_range"
+    done
+  else
+    ufw allow "$port"/tcp >/dev/null || true
+    ufw allow "$ufw_udp_range"/udp >/dev/null || true
+    echo "ufw allow: public tcp/$port udp/$ufw_udp_range"
+  fi
+}
+
+bootstrap() {
+  need_root
+  local iface="" port="1080" udp_range="20000-20100"
+  local proxy_user="proxy-user" proxy_password="" reset_password="false"
+  local fmt="generic" skip_fail2ban="false" skip_ufw="false" dry_run="false"
+  local -a allow_ips=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --iface)
+        shift
+        [[ $# -gt 0 ]] || err "--iface requires a value"
+        iface="$1"
+        ;;
+      --port)
+        shift
+        [[ $# -gt 0 ]] || err "--port requires a value"
+        port="$1"
+        ;;
+      --udp-range)
+        shift
+        [[ $# -gt 0 ]] || err "--udp-range requires a value"
+        udp_range="$1"
+        ;;
+      --proxy-user)
+        shift
+        [[ $# -gt 0 ]] || err "--proxy-user requires a value"
+        proxy_user="$1"
+        ;;
+      --proxy-password)
+        shift
+        [[ $# -gt 0 ]] || err "--proxy-password requires a value"
+        proxy_password="$1"
+        reset_password="true"
+        ;;
+      --proxy-password-random)
+        proxy_password="$(random_password)"
+        reset_password="true"
+        ;;
+      --reset-password)
+        reset_password="true"
+        ;;
+      --format)
+        shift
+        [[ $# -gt 0 ]] || err "--format requires a value"
+        fmt="$1"
+        ;;
+      --allow-ip)
+        shift
+        [[ $# -gt 0 ]] || err "--allow-ip requires a value"
+        allow_ips+=( "$1" )
+        ;;
+      --public)
+        ;;
+      --skip-fail2ban)
+        skip_fail2ban="true"
+        ;;
+      --skip-ufw)
+        skip_ufw="true"
+        ;;
+      --dry-run)
+        dry_run="true"
+        ;;
+      help|-h|--help)
+        print_bootstrap_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$iface" ]] || iface="$(default_iface)"
+  [[ -n "$iface" ]] || err "could not detect interface; use --iface"
+  username_ok "$proxy_user" || err "invalid username format: $proxy_user"
+  port_ok "$port" || err "invalid port: $port"
+  [[ "$udp_range" =~ ^[0-9]+-[0-9]+$ ]] || err "invalid udp range: $udp_range"
+  [[ "$fmt" == "generic" || "$fmt" == "telegram" || "$fmt" == "uri" ]] || err "invalid format: $fmt"
+
+  echo "[bootstrap]"
+  echo "iface: $iface"
+  echo "port: $port"
+  echo "udp_range: $udp_range"
+  echo "proxy_user: $proxy_user"
+  echo "fail2ban: $([[ "$skip_fail2ban" == "true" ]] && echo disabled || echo enabled)"
+  echo "ufw: $([[ "$skip_ufw" == "true" ]] && echo skipped || echo managed)"
+  if (( ${#allow_ips[@]} > 0 )); then
+    echo "allow_ips: ${allow_ips[*]}"
+  else
+    echo "allow_ips: public"
+  fi
+  echo "dry_run: $dry_run"
+
+  if [[ "$dry_run" == "true" ]]; then
+    echo "would run: apt-get update"
+    if [[ "$skip_fail2ban" == "true" ]]; then
+      echo "would run: apt-get install -y dante-server ufw"
+    else
+      echo "would run: apt-get install -y dante-server ufw fail2ban"
+    fi
+    echo "would write: $DANTED_CONF"
+    echo "would write: $PAM_DANTED_FILE"
+    if [[ "$skip_fail2ban" != "true" ]]; then
+      echo "would write: $FAIL2BAN_DANTED_FILTER"
+      echo "would write: $FAIL2BAN_DANTED_JAIL"
+    fi
+    if [[ "$skip_ufw" != "true" ]]; then
+      if (( ${#allow_ips[@]} > 0 )); then
+        echo "would manage ufw for: ${allow_ips[*]}"
+      else
+        echo "would manage ufw for: public"
+      fi
+    fi
+    echo "would ensure proxy user: $proxy_user"
+    return
+  fi
+
+  apt-get update
+  if [[ "$skip_fail2ban" == "true" ]]; then
+    apt-get install -y dante-server ufw
+  else
+    apt-get install -y dante-server ufw fail2ban
+  fi
+
+  ensure_runtime_dirs
+  ensure_group
+  write_managed_file "$DANTED_CONF" "$(render_bootstrap_danted_conf "$iface" "$port" "$udp_range")"
+  write_managed_file "$PAM_DANTED_FILE" "$(render_bootstrap_pam_danted)"
+  if [[ "$skip_fail2ban" != "true" ]]; then
+    write_managed_file "$FAIL2BAN_DANTED_FILTER" "$(render_bootstrap_fail2ban_filter)"
+    write_managed_file "$FAIL2BAN_DANTED_JAIL" "$(render_bootstrap_fail2ban_jail "$port")"
+  fi
+
+  systemctl daemon-reload
+  systemctl enable danted
+  systemctl restart danted
+  if [[ "$skip_fail2ban" != "true" ]]; then
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+  fi
+
+  bootstrap_user_ensure "$proxy_user" "$proxy_password" "$reset_password" "$fmt"
+
+  if [[ "$skip_ufw" != "true" ]]; then
+    bootstrap_configure_ufw "$port" "$udp_range" "${allow_ips[@]}"
+  fi
+
+  echo
+  doctor
 }
 
 service_status() {
@@ -1174,12 +1641,18 @@ audit() {
   echo "[audit]"
   echo "window: $since"
 
-  local fail_lines fail_count
-  fail_lines="$(journalctl --since "$since" --no-pager | match_lines "pam_unix\\(danted:auth\\): authentication failure")"
-  if [[ -z "$fail_lines" ]]; then
+  local auth_tmp danted_tmp
+  auth_tmp="$(mktemp)"
+  danted_tmp="$(mktemp)"
+  trap 'rm -f "${auth_tmp:-}" "${danted_tmp:-}"' RETURN
+
+  journalctl --since "$since" --grep 'pam_unix\(danted:auth\): authentication failure' --no-pager > "$auth_tmp" 2>/dev/null || true
+  journalctl -u "$DANTED_SERVICE" --since "$since" --grep 'username%[^@]+@|block\([0-9]+\): tcp/accept .*no rules matched' --no-pager > "$danted_tmp" 2>/dev/null || true
+
+  local fail_count
+  fail_count="$(sed '/^$/d' "$auth_tmp" | wc -l)"
+  if [[ ! -s "$auth_tmp" ]]; then
     fail_count=0
-  else
-    fail_count="$(printf "%s\n" "$fail_lines" | sed '/^$/d' | wc -l)"
   fi
 
   echo
@@ -1187,51 +1660,45 @@ audit() {
   echo "count: $fail_count"
   if [[ "$fail_count" -gt 0 ]]; then
     echo "top_source_ips:"
-    printf "%s\n" "$fail_lines" \
-      | sed -n 's/.*rhost=\([^ ]*\).*/\1/p' \
-      | sort | uniq -c | sort -nr | head -n 10
+    sed -n 's/.*rhost=\([^ ]*\).*/\1/p' "$auth_tmp" \
+      | sed '/^$/d' \
+      | awk '{c[$1]++} END {for (ip in c) printf "%7d %s\n", c[ip], ip}' \
+      | sort -nr | head -n 10
   fi
-
-  local success_lines
-  success_lines="$(journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager | match_lines "username%[^@]+@")"
 
   echo
   echo "[top_users_success]"
-  if [[ -z "$success_lines" ]]; then
+  if ! grep -q 'username%' "$danted_tmp"; then
     echo "no data"
   else
-    printf "%s\n" "$success_lines" \
-      | sed -n 's/.*username%\([^@ ]*\)@.*/\1/p' \
-      | sort | uniq -c | sort -nr | head -n 10
+    sed -n 's/.*username%\([^@ ]*\)@.*/\1/p' "$danted_tmp" \
+      | sed '/^$/d' \
+      | awk '{c[$1]++} END {for (user in c) printf "%7d %s\n", c[user], user}' \
+      | sort -nr | head -n 10
   fi
 
   echo
   echo "[top_source_ips_success]"
-  if [[ -z "$success_lines" ]]; then
+  if ! grep -q 'username%' "$danted_tmp"; then
     echo "no data"
   else
-    printf "%s\n" "$success_lines" \
-      | sed -n 's/.*username%[^@]*@\([0-9.]*\)\.[0-9][0-9]* .*/\1/p' \
+    sed -n 's/.*username%[^@]*@\([0-9.]*\)\.[0-9][0-9]* .*/\1/p' "$danted_tmp" \
       | sed '/^$/d' \
-      | sort | uniq -c | sort -nr | head -n 10
+      | awk '{c[$1]++} END {for (ip in c) printf "%7d %s\n", c[ip], ip}' \
+      | sort -nr | head -n 10
   fi
 
-  local blocked_lines blocked_count
-  blocked_lines="$(journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager | match_lines "block\\([0-9]+\\): tcp/accept .*no rules matched")"
-  if [[ -z "$blocked_lines" ]]; then
-    blocked_count=0
-  else
-    blocked_count="$(printf "%s\n" "$blocked_lines" | sed '/^$/d' | wc -l)"
-  fi
+  local blocked_count
+  blocked_count="$(grep -Ec 'block\([0-9]+\): tcp/accept .*no rules matched' "$danted_tmp" || true)"
   echo
   echo "[blocked_by_rules]"
   echo "count: $blocked_count"
   if [[ "$blocked_count" -gt 0 ]]; then
     echo "top_source_ips:"
-    printf "%s\n" "$blocked_lines" \
-      | perl -ne 'print "$1\n" if /: ([0-9]+(?:\.[0-9]+){3})\.[0-9]+ [0-9]+(?:\.[0-9]+){3}\.[0-9]+: blocked/' \
+    perl -ne 'print "$1\n" if /: ([0-9]+(?:\.[0-9]+){3})\.[0-9]+ [0-9]+(?:\.[0-9]+){3}\.[0-9]+: blocked/' "$danted_tmp" \
       | sed '/^$/d' \
-      | sort | uniq -c | sort -nr | head -n 10
+      | awk '{c[$1]++} END {for (ip in c) printf "%7d %s\n", c[ip], ip}' \
+      | sort -nr | head -n 10
   fi
 
   echo
@@ -1331,8 +1798,20 @@ legacy_alias() {
 
     allow-ip) firewall_allow_ip "$@" ;;
     revoke-ip) firewall_revoke_ip "$@" ;;
-    audit) audit "$@" ;;
-    usage) usage "$@" ;;
+    audit)
+      if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        print_audit_help
+      else
+        audit "$@"
+      fi
+      ;;
+    usage)
+      if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        print_usage_help
+      else
+        usage "$@"
+      fi
+      ;;
     *) return 1 ;;
   esac
   return 0
@@ -1600,6 +2079,14 @@ main() {
       print_main_help
       ;;
 
+    bootstrap)
+      if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        print_bootstrap_help
+      else
+        bootstrap "$@"
+      fi
+      ;;
+
     service)
       local cmd="${1:-help}"
       shift || true
@@ -1669,11 +2156,19 @@ main() {
       ;;
 
     audit)
-      audit "$@"
+      if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        print_audit_help
+      else
+        audit "$@"
+      fi
       ;;
 
     usage)
-      usage "$@"
+      if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        print_usage_help
+      else
+        usage "$@"
+      fi
       ;;
 
     quota)

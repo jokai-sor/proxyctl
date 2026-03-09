@@ -1,0 +1,11 @@
+[Unit]
+Description=Warm proxyctl monthly usage cache periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=proxyctl-usage-cache-warm.service
+
+[Install]
+WantedBy=timers.target

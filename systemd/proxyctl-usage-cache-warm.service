@@ -1,0 +1,10 @@
+[Unit]
+Description=Warm proxyctl monthly usage cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl usage --warm-cache
+User=root
+Group=root
