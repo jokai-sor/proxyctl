@@ -1,0 +1,1702 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROXY_GROUP="proxyusers"
+DANTED_SERVICE="danted"
+DANTED_CONF="/etc/danted.conf"
+PROXYCTL_LANG_FILE="/etc/proxyctl/lang"
+PROXYCTL_QUOTA_FILE="/etc/proxyctl/quotas.conf"
+LANG_CODE="en"
+UI_COLOR=1
+UI_WIDTH=88
+CLR_RESET=""
+CLR_TITLE=""
+CLR_ACCENT=""
+CLR_OK=""
+CLR_WARN=""
+CLR_ERR=""
+
+err() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "run as root: sudo proxyctl <command>"
+  fi
+}
+
+username_ok() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,30}$ ]]
+}
+
+port_ok() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+}
+
+ensure_group() {
+  if ! getent group "$PROXY_GROUP" >/dev/null; then
+    groupadd "$PROXY_GROUP"
+  fi
+}
+
+require_user() {
+  id "$1" >/dev/null 2>&1 || err "user '$1' not found"
+}
+
+proxy_port() {
+  local port
+  port="$(sed -n 's/^internal:.*port *= *\([0-9]\+\).*/\1/p' "$DANTED_CONF" | head -n1 || true)"
+  if [[ -z "$port" ]]; then
+    echo "1080"
+  else
+    echo "$port"
+  fi
+}
+
+proxy_internal_iface() {
+  local iface
+  iface="$(sed -n 's/^internal:[[:space:]]*\([^[:space:]]\+\).*/\1/p' "$DANTED_CONF" | head -n1 || true)"
+  if [[ -z "$iface" ]]; then
+    echo "eth0"
+  else
+    echo "$iface"
+  fi
+}
+
+proxy_host() {
+  local bind
+  bind="$(sed -n 's/^internal:[[:space:]]*\([^[:space:]]\+\).*/\1/p' "$DANTED_CONF" | head -n1 || true)"
+  if [[ -z "$bind" ]]; then
+    hostname -I | awk '{print $1}'
+    return
+  fi
+
+  if [[ "$bind" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$bind" == *":"* ]]; then
+    echo "$bind"
+    return
+  fi
+
+  ip -4 -o addr show dev "$bind" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
+
+random_password() {
+  openssl rand -base64 24 | tr -d '\n'
+}
+
+urlencode() {
+  local s="$1"
+  local out=""
+  local i c
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+    esac
+  done
+  echo "$out"
+}
+
+print_access_data() {
+  local user="$1"
+  local pass="$2"
+  local host="$3"
+  local port="$4"
+  local fmt="$5"
+
+  case "$fmt" in
+    generic)
+      echo "$(t access_block):"
+      echo "host: $host"
+      echo "port: $port"
+      echo "username: $user"
+      echo "password: $pass"
+      ;;
+    telegram)
+      echo "https://t.me/socks?server=$(urlencode "$host")&port=$(urlencode "$port")&user=$(urlencode "$user")&pass=$(urlencode "$pass")"
+      ;;
+    uri)
+      if [[ "$pass" == "$(t password_unknown)" ]]; then
+        echo "socks5://$user:<hidden>@$host:$port"
+      else
+        echo "socks5://$(urlencode "$user"):$(urlencode "$pass")@$host:$port"
+      fi
+      ;;
+    *)
+      err "unknown format: $fmt (supported: generic, telegram, uri)"
+      ;;
+  esac
+}
+
+load_lang() {
+  if [[ -f "$PROXYCTL_LANG_FILE" ]]; then
+    local v
+    v="$(tr -d '[:space:]' < "$PROXYCTL_LANG_FILE" || true)"
+    if [[ "$v" == "ru" || "$v" == "en" ]]; then
+      LANG_CODE="$v"
+    fi
+  fi
+}
+
+save_lang() {
+  need_root
+  local new_lang="$1"
+  [[ "$new_lang" == "ru" || "$new_lang" == "en" ]] || err "supported languages: ru, en"
+  mkdir -p "$(dirname "$PROXYCTL_LANG_FILE")"
+  echo "$new_lang" > "$PROXYCTL_LANG_FILE"
+  LANG_CODE="$new_lang"
+}
+
+t() {
+  local key="$1"
+  if [[ "$LANG_CODE" == "ru" ]]; then
+    case "$key" in
+      select) echo "Выбор"; return ;;
+      invalid) echo "Неверный выбор."; return ;;
+      cancelled) echo "Отменено."; return ;;
+      back) echo "Назад"; return ;;
+      exit) echo "Выход"; return ;;
+      username) echo "Имя пользователя"; return ;;
+      password) echo "Пароль"; return ;;
+      new_password) echo "Новый пароль"; return ;;
+      existing_username) echo "Существующий пользователь"; return ;;
+      ip_cidr) echo "IP или CIDR"; return ;;
+      new_port) echo "Новый порт"; return ;;
+      backup_path) echo "Путь к backup-файлу"; return ;;
+      bye) echo "Выход."; return ;;
+      user_menu) echo "[Меню пользователей]"; return ;;
+      firewall_menu) echo "[Меню firewall]"; return ;;
+      config_menu) echo "[Меню конфигурации]"; return ;;
+      main_menu) echo "Интерактивный режим"; return ;;
+      list_users) echo "Список пользователей"; return ;;
+      add_user) echo "Добавить пользователя"; return ;;
+      adopt_user) echo "Добавить существующего пользователя"; return ;;
+      change_password) echo "Сменить пароль"; return ;;
+      lock_user) echo "Заблокировать пользователя"; return ;;
+      unlock_user) echo "Разблокировать пользователя"; return ;;
+      delete_user) echo "Удалить пользователя"; return ;;
+      access_data) echo "Данные доступа"; return ;;
+      ufw_status) echo "Статус UFW"; return ;;
+      allow_ip) echo "Разрешить IP/CIDR"; return ;;
+      revoke_ip) echo "Отозвать IP/CIDR"; return ;;
+      open_public) echo "Открыть SOCKS порт всем (опасно)"; return ;;
+      close_public) echo "Закрыть публичный SOCKS порт"; return ;;
+      show_config) echo "Показать конфиг"; return ;;
+      show_port) echo "Показать текущий порт"; return ;;
+      change_port) echo "Сменить порт"; return ;;
+      backup_config) echo "Сделать backup конфига"; return ;;
+      restore_config) echo "Восстановить конфиг"; return ;;
+      health_check) echo "Проверка состояния (doctor)"; return ;;
+      service_status) echo "Статус сервиса"; return ;;
+      service_restart) echo "Перезапуск сервиса"; return ;;
+      live_logs) echo "Логи в реальном времени"; return ;;
+      active_connections) echo "Активные соединения"; return ;;
+      user_management) echo "Управление пользователями"; return ;;
+      firewall_management) echo "Управление firewall"; return ;;
+      config_management) echo "Управление конфигом"; return ;;
+      help) echo "Справка"; return ;;
+      language) echo "Язык"; return ;;
+      audit) echo "Аудит"; return ;;
+      usage) echo "Трафик"; return ;;
+      quota) echo "Квоты"; return ;;
+      random_password_q) echo "Использовать случайный пароль? (Y/n)"; return ;;
+      delete_confirm) echo "Удалить пользователя '%s'? Введите YES"; return ;;
+      open_confirm) echo "Открыть SOCKS порт для всех? Введите OPEN"; return ;;
+      lang_now) echo "Текущий язык"; return ;;
+      lang_set_prompt) echo "Выберите язык (ru/en)"; return ;;
+      lang_changed) echo "Язык переключен"; return ;;
+      reset_password_q) echo "Сбросить пароль и показать новый? (Y/n)"; return ;;
+      format_prompt) echo "Формат (generic/telegram/uri) [generic]"; return ;;
+      access_block) echo "Блок для отправки"; return ;;
+      password_unknown) echo "<скрыт; сбросьте пароль, чтобы показать новый>"; return ;;
+      continue_prompt) echo "Нажмите Enter для продолжения..."; return ;;
+      hotkeys_hint) echo "Горячие клавиши: h=help, b=назад, q=выход"; return ;;
+    esac
+  fi
+
+  case "$key" in
+    select) echo "Select" ;;
+    invalid) echo "Invalid choice." ;;
+    cancelled) echo "Cancelled." ;;
+    back) echo "Back" ;;
+    exit) echo "Exit" ;;
+    username) echo "Username" ;;
+    password) echo "Password" ;;
+    new_password) echo "New password" ;;
+    existing_username) echo "Existing username" ;;
+    ip_cidr) echo "IP or CIDR" ;;
+    new_port) echo "New port" ;;
+    backup_path) echo "Backup file path" ;;
+    bye) echo "Bye." ;;
+    user_menu) echo "[User Menu]" ;;
+    firewall_menu) echo "[Firewall Menu]" ;;
+    config_menu) echo "[Config Menu]" ;;
+    main_menu) echo "Interactive mode" ;;
+    list_users) echo "List users" ;;
+    add_user) echo "Add user" ;;
+    adopt_user) echo "Adopt existing user" ;;
+    change_password) echo "Change password" ;;
+    lock_user) echo "Lock user" ;;
+    unlock_user) echo "Unlock user" ;;
+    delete_user) echo "Delete user" ;;
+    access_data) echo "Access data" ;;
+    ufw_status) echo "UFW status" ;;
+    allow_ip) echo "Allow IP/CIDR" ;;
+    revoke_ip) echo "Revoke IP/CIDR" ;;
+    open_public) echo "Open SOCKS port to public (danger)" ;;
+    close_public) echo "Close public SOCKS port" ;;
+    show_config) echo "Show config" ;;
+    show_port) echo "Show current port" ;;
+    change_port) echo "Change port" ;;
+    backup_config) echo "Backup config" ;;
+    restore_config) echo "Restore config" ;;
+    health_check) echo "Health check (doctor)" ;;
+    service_status) echo "Service status" ;;
+    service_restart) echo "Service restart" ;;
+    live_logs) echo "Live logs" ;;
+    active_connections) echo "Active connections" ;;
+    user_management) echo "User management" ;;
+    firewall_management) echo "Firewall management" ;;
+    config_management) echo "Config management" ;;
+    help) echo "Help" ;;
+    language) echo "Language" ;;
+    audit) echo "Audit" ;;
+    usage) echo "Usage" ;;
+    quota) echo "Quota" ;;
+    random_password_q) echo "Use random password? (Y/n)" ;;
+    delete_confirm) echo "Delete user '%s'? Type YES" ;;
+    open_confirm) echo "Open SOCKS port to everyone? Type OPEN" ;;
+    lang_now) echo "Current language" ;;
+    lang_set_prompt) echo "Choose language (ru/en)" ;;
+    lang_changed) echo "Language changed" ;;
+    reset_password_q) echo "Reset password and show a new one? (Y/n)" ;;
+    format_prompt) echo "Format (generic/telegram/uri) [generic]" ;;
+    access_block) echo "Share block" ;;
+    password_unknown) echo "<hidden; reset password to reveal new>" ;;
+    continue_prompt) echo "Press Enter to continue..." ;;
+    hotkeys_hint) echo "Hotkeys: h=help, b=back, q=quit" ;;
+    *) echo "$key" ;;
+  esac
+}
+
+ui_init() {
+  ui_width_init
+  if [[ "${NO_COLOR:-}" != "" ]]; then
+    UI_COLOR=0
+  fi
+  if [[ ! -t 1 ]]; then
+    UI_COLOR=0
+  fi
+  if [[ "$UI_COLOR" -eq 1 ]]; then
+    CLR_RESET=$'\033[0m'
+    CLR_TITLE=$'\033[1;36m'
+    CLR_ACCENT=$'\033[1;34m'
+    CLR_OK=$'\033[1;32m'
+    CLR_WARN=$'\033[1;33m'
+    CLR_ERR=$'\033[1;31m'
+  fi
+}
+
+ui_color() {
+  local c="$1"
+  shift
+  if [[ "$UI_COLOR" -eq 1 ]]; then
+    printf "%b%s%b" "$c" "$*" "$CLR_RESET"
+  else
+    printf "%s" "$*"
+  fi
+}
+
+ui_hr() {
+  printf '%*s\n' "$UI_WIDTH" '' | tr ' ' '-'
+}
+
+ui_width_init() {
+  local w="${COLUMNS:-88}"
+  if ! [[ "$w" =~ ^[0-9]+$ ]]; then
+    w=88
+  fi
+  if (( w < 72 )); then
+    w=72
+  fi
+  if (( w > 104 )); then
+    w=104
+  fi
+  UI_WIDTH="$w"
+}
+
+ui_block_line() {
+  local text="$1"
+  local max=$((UI_WIDTH - 4))
+  if ((${#text} > max)); then
+    text="${text:0:max}"
+  fi
+  printf "| %-*s |\n" "$max" "$text"
+}
+
+ui_box_open() {
+  printf "+%s+\n" "$(printf '%*s' "$((UI_WIDTH - 2))" '' | tr ' ' '-')"
+}
+
+ui_box_close() {
+  ui_box_open
+}
+
+ui_header() {
+  local title="$1"
+  echo
+  ui_box_open
+  ui_block_line "proxyctl"
+  ui_block_line "$title"
+  ui_box_close
+}
+
+ui_service_state() {
+  local svc="$1"
+  if systemctl is-active --quiet "$svc"; then
+    printf "active"
+  else
+    printf "down"
+  fi
+}
+
+ui_statusbar() {
+  local host port lang
+  host="$(proxy_host || true)"
+  [[ -n "$host" ]] || host="unknown"
+  port="$(proxy_port)"
+  lang="$(lang_show 2>/dev/null || echo "$LANG_CODE")"
+  ui_block_line "danted=$(ui_service_state danted) | fail2ban=$(ui_service_state fail2ban)"
+  ui_block_line "host=$host | port=$port | lang=$lang"
+  ui_box_close
+}
+
+ui_menu_item() {
+  local n="$1"
+  shift
+  printf "  %-2s %s\n" "$n)" "$*"
+}
+
+ui_prompt() {
+  local label="$1"
+  read -r -p "  $label: " REPLY
+}
+
+ui_note() {
+  printf "\n  %s\n\n" "$*"
+}
+
+ui_pause() {
+  printf "\n"
+  read -r -p "  $(t continue_prompt) " _
+}
+
+ui_section_spacer() {
+  printf "\n"
+}
+
+ui_hotkeys_hint() {
+  printf "  %s\n\n" "$(t hotkeys_hint)"
+}
+
+run_action() {
+  safe_call "$@"
+  ui_pause
+}
+
+match_lines() {
+  local pattern="$1"
+  if command -v rg >/dev/null 2>&1; then
+    rg "$pattern" || true
+  else
+    grep -E "$pattern" || true
+  fi
+}
+
+print_main_help() {
+  cat <<'HELP'
+proxyctl - CLI for Dante SOCKS5 management
+
+Usage:
+  proxyctl <group> <command> [options]
+
+Command groups:
+  service     Manage danted service and logs
+  user        Manage SOCKS users
+  firewall    Manage UFW rules for SOCKS port
+  config      View/change danted config basics
+  lang        Show/set interface language (en/ru)
+  audit       Security/activity audit summary
+  usage       Per-user traffic usage from danted logs
+  quota       Per-user traffic quota and enforcement
+  doctor      Run quick health checks
+  help        Show this help
+
+Examples:
+  sudo proxyctl service status
+  sudo proxyctl user add alice --random
+  sudo proxyctl firewall allow-ip 203.0.113.10
+  sudo proxyctl config port 2080
+  sudo proxyctl lang set ru
+  sudo proxyctl audit --since "24 hours ago"
+  sudo proxyctl usage
+  sudo proxyctl quota list
+  sudo proxyctl doctor
+
+Legacy aliases (still supported):
+  status restart logs connections show-config ufw-status
+  list-users adopt-user add-user set-password lock unlock del-user
+  allow-ip revoke-ip
+HELP
+}
+
+print_lang_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl lang show
+  proxyctl lang set <en|ru>
+HELP
+}
+
+print_audit_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl audit [--since "24 hours ago"]
+HELP
+}
+
+print_usage_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl usage [--since "YYYY-MM-01 00:00:00"] [--user <username>]
+
+Defaults:
+  --since = first day of current month (UTC)
+HELP
+}
+
+print_quota_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl quota list [--since "YYYY-MM-01 00:00:00"]
+  proxyctl quota set <username> <GB>
+  proxyctl quota del <username>
+  proxyctl quota enforce [--since "YYYY-MM-01 00:00:00"] [--dry-run]
+HELP
+}
+
+print_service_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl service status
+  proxyctl service restart
+  proxyctl service logs [--since "1 hour ago"] [--follow]
+  proxyctl service connections
+HELP
+}
+
+print_user_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl user list
+  proxyctl user adopt <username>
+  proxyctl user add <username> [--password <pass> | --random] [--format generic|telegram|uri]
+  proxyctl user passwd <username> [--password <pass> | --random]
+  proxyctl user access <username> [--reset-password] [--format generic|telegram|uri]
+  proxyctl user lock <username>
+  proxyctl user unlock <username>
+  proxyctl user delete <username>
+HELP
+}
+
+print_firewall_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl firewall status
+  proxyctl firewall allow-ip <ip-or-cidr> [--port <port>]
+  proxyctl firewall revoke-ip <ip-or-cidr> [--port <port>]
+  proxyctl firewall open-public [--port <port>]
+  proxyctl firewall close-public [--port <port>]
+HELP
+}
+
+print_config_help() {
+  cat <<'HELP'
+Usage:
+  proxyctl config show
+  proxyctl config port [<new-port>]
+  proxyctl config backup
+  proxyctl config restore <backup-file>
+HELP
+}
+
+month_start_utc() {
+  date -u +"%Y-%m-01 00:00:00"
+}
+
+bytes_to_human() {
+  local b="${1:-0}"
+  awk -v b="$b" 'BEGIN{
+    split("B KiB MiB GiB TiB",u," ");
+    i=1;
+    while (b>=1024 && i<5) { b/=1024; i++ }
+    printf "%.2f %s", b, u[i];
+  }'
+}
+
+gb_to_bytes() {
+  local gb="$1"
+  awk -v g="$gb" 'BEGIN{printf "%.0f", g*1024*1024*1024}'
+}
+
+usage_rows() {
+  local since="$1"
+  journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager \
+    | match_lines "tcp/connect \\]:" \
+    | perl -ne '
+        if (/username%([^@ ]+)@.*->\s*([0-9]+),\s*([0-9]+)\s*->/) {
+          print "$1 ", ($2+$3), "\n";
+        }
+      ' \
+    | awk '{s[$1]+=$2} END {for (u in s) printf "%s %d\n", u, s[u]}' \
+    | sort
+}
+
+usage() {
+  need_root
+  local since user
+  since="$(month_start_utc)"
+  user=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        [[ $# -gt 0 ]] || err "--since requires a value"
+        since="$1"
+        ;;
+      --user)
+        shift
+        [[ $# -gt 0 ]] || err "--user requires a value"
+        user="$1"
+        ;;
+      -h|--help)
+        print_usage_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  local rows
+  rows="$(usage_rows "$since" || true)"
+
+  echo "[usage]"
+  echo "since: $since"
+  echo
+  printf "%-22s %-14s %-12s\n" "user" "bytes" "human"
+  printf "%-22s %-14s %-12s\n" "----------------------" "--------------" "------------"
+
+  if [[ -z "$rows" ]]; then
+    echo "no data"
+    return
+  fi
+
+  local total=0
+  while read -r u b; do
+    [[ -n "$u" ]] || continue
+    if [[ -n "$user" && "$u" != "$user" ]]; then
+      continue
+    fi
+    total=$((total + b))
+    printf "%-22s %-14s %-12s\n" "$u" "$b" "$(bytes_to_human "$b")"
+  done <<< "$rows"
+
+  echo
+  printf "%-22s %-14s %-12s\n" "TOTAL" "$total" "$(bytes_to_human "$total")"
+}
+
+quota_file_ensure() {
+  mkdir -p "$(dirname "$PROXYCTL_QUOTA_FILE")"
+  touch "$PROXYCTL_QUOTA_FILE"
+}
+
+quota_set() {
+  need_root
+  [[ $# -eq 2 ]] || err "usage: proxyctl quota set <username> <GB>"
+  local user="$1"
+  local gb="$2"
+  require_user "$user"
+  [[ "$gb" =~ ^[0-9]+([.][0-9]+)?$ ]] || err "GB must be numeric"
+  quota_file_ensure
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F= -v u="$user" '$1!=u && NF>=2 {print $0}' "$PROXYCTL_QUOTA_FILE" > "$tmp"
+  echo "${user}=${gb}" >> "$tmp"
+  sort -u "$tmp" > "$PROXYCTL_QUOTA_FILE"
+  rm -f "$tmp"
+  echo "quota set: $user = ${gb} GB"
+}
+
+quota_del() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl quota del <username>"
+  local user="$1"
+  quota_file_ensure
+  local tmp
+  tmp="$(mktemp)"
+  awk -F= -v u="$user" '$1!=u && NF>=2 {print $0}' "$PROXYCTL_QUOTA_FILE" > "$tmp"
+  mv "$tmp" "$PROXYCTL_QUOTA_FILE"
+  echo "quota removed: $user"
+}
+
+quota_list() {
+  need_root
+  local since
+  since="$(month_start_utc)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        [[ $# -gt 0 ]] || err "--since requires a value"
+        since="$1"
+        ;;
+      -h|--help)
+        print_quota_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  quota_file_ensure
+  local rows
+  rows="$(usage_rows "$since" || true)"
+
+  echo "[quota]"
+  echo "since: $since"
+  echo "file: $PROXYCTL_QUOTA_FILE"
+  echo
+  printf "%-22s %-10s %-14s %-12s %-8s\n" "user" "limit(GB)" "used(bytes)" "used(human)" "status"
+  printf "%-22s %-10s %-14s %-12s %-8s\n" "----------------------" "----------" "--------------" "------------" "--------"
+
+  while IFS='=' read -r u g; do
+    [[ -n "$u" && -n "$g" ]] || continue
+    local used=0 lim
+    used="$(awk -v usr="$u" '$1==usr {print $2}' <<< "$rows" | head -n1)"
+    [[ -n "$used" ]] || used=0
+    lim="$(gb_to_bytes "$g")"
+    local st="ok"
+    if (( used > lim )); then st="over"; fi
+    printf "%-22s %-10s %-14s %-12s %-8s\n" "$u" "$g" "$used" "$(bytes_to_human "$used")" "$st"
+  done < "$PROXYCTL_QUOTA_FILE"
+}
+
+quota_enforce() {
+  need_root
+  local since dry
+  since="$(month_start_utc)"
+  dry="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        [[ $# -gt 0 ]] || err "--since requires a value"
+        since="$1"
+        ;;
+      --dry-run) dry="true" ;;
+      -h|--help)
+        print_quota_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  quota_file_ensure
+  local rows
+  rows="$(usage_rows "$since" || true)"
+
+  echo "[quota-enforce]"
+  echo "since: $since"
+  echo "dry_run: $dry"
+
+  while IFS='=' read -r u g; do
+    [[ -n "$u" && -n "$g" ]] || continue
+    if ! id "$u" >/dev/null 2>&1; then
+      echo "skip: $u (user not found)"
+      continue
+    fi
+    local used=0 lim state
+    used="$(awk -v usr="$u" '$1==usr {print $2}' <<< "$rows" | head -n1)"
+    [[ -n "$used" ]] || used=0
+    lim="$(gb_to_bytes "$g")"
+    state="$(passwd -S "$u" | awk '{print $2}')"
+
+    if (( used > lim )); then
+      if [[ "$state" == "L" ]]; then
+        echo "locked: $u (already locked, used=$(bytes_to_human "$used"), limit=${g}GB)"
+      else
+        if [[ "$dry" == "true" ]]; then
+          echo "would lock: $u (used=$(bytes_to_human "$used"), limit=${g}GB)"
+        else
+          passwd -l "$u" >/dev/null
+          echo "locked: $u (used=$(bytes_to_human "$used"), limit=${g}GB)"
+        fi
+      fi
+    else
+      echo "ok: $u (used=$(bytes_to_human "$used"), limit=${g}GB)"
+    fi
+  done < "$PROXYCTL_QUOTA_FILE"
+}
+
+set_password() {
+  local user="$1"
+  shift
+  local mode="random"
+  local pass=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --password)
+        shift
+        [[ $# -gt 0 ]] || err "--password requires a value"
+        mode="manual"
+        pass="$1"
+        ;;
+      --random)
+        mode="random"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$mode" == "random" ]]; then
+    pass="$(random_password)"
+  fi
+
+  echo "${user}:${pass}" | chpasswd
+  echo "username: ${user}"
+  echo "password: ${pass}"
+}
+
+service_status() {
+  need_root
+  systemctl --no-pager --full status "$DANTED_SERVICE"
+}
+
+service_restart() {
+  need_root
+  systemctl restart "$DANTED_SERVICE"
+  systemctl --no-pager --full status "$DANTED_SERVICE" | sed -n '1,12p'
+}
+
+service_logs() {
+  need_root
+  local since=""
+  local follow="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        [[ $# -gt 0 ]] || err "--since requires a value"
+        since="$1"
+        ;;
+      --follow)
+        follow="true"
+        ;;
+      -h|--help)
+        print_service_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  local -a args=( -u "$DANTED_SERVICE" )
+  [[ -n "$since" ]] && args+=( --since "$since" )
+  if [[ "$follow" == "true" ]]; then
+    args+=( -f )
+  else
+    args+=( -n 100 )
+  fi
+  journalctl "${args[@]}"
+}
+
+service_connections() {
+  need_root
+  ss -tnp | awk 'NR==1 || /danted/'
+}
+
+user_list() {
+  need_root
+  ensure_group
+  local members
+  members="$(getent group "$PROXY_GROUP" | awk -F: '{print $4}')"
+  if [[ -z "$members" ]]; then
+    echo "No managed proxy users in group '$PROXY_GROUP'."
+    return
+  fi
+
+  IFS=',' read -r -a arr <<< "$members"
+  for u in "${arr[@]}"; do
+    if id "$u" >/dev/null 2>&1; then
+      local state
+      state="$(passwd -S "$u" | awk '{print $2}')"
+      echo "$u (passwd_state=$state)"
+    fi
+  done
+}
+
+user_adopt() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl user adopt <username>"
+  local user="$1"
+  require_user "$user"
+  ensure_group
+  usermod -aG "$PROXY_GROUP" "$user"
+  echo "user '$user' added to group '$PROXY_GROUP'"
+}
+
+user_add() {
+  need_root
+  [[ $# -ge 1 ]] || err "usage: proxyctl user add <username> [--password <pass> | --random] [--format generic|telegram|uri]"
+  local user="$1"
+  shift
+  local mode="random"
+  local pass=""
+  local fmt="generic"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --password)
+        shift
+        [[ $# -gt 0 ]] || err "--password requires a value"
+        mode="manual"
+        pass="$1"
+        ;;
+      --random)
+        mode="random"
+        ;;
+      --format)
+        shift
+        [[ $# -gt 0 ]] || err "--format requires a value"
+        fmt="$1"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  username_ok "$user" || err "invalid username format: $user"
+  if id "$user" >/dev/null 2>&1; then
+    err "user '$user' already exists"
+  fi
+
+  if [[ "$mode" == "random" ]]; then
+    pass="$(random_password)"
+  fi
+
+  ensure_group
+  useradd -M -s /usr/sbin/nologin -G "$PROXY_GROUP" "$user"
+  echo "${user}:${pass}" | chpasswd
+
+  local host
+  host="$(proxy_host || true)"
+  [[ -n "$host" ]] || host="unknown"
+  print_access_data "$user" "$pass" "$host" "$(proxy_port)" "$fmt"
+}
+
+user_passwd() {
+  need_root
+  [[ $# -ge 1 ]] || err "usage: proxyctl user passwd <username> [--password <pass> | --random]"
+  local user="$1"
+  shift
+  require_user "$user"
+  set_password "$user" "$@"
+}
+
+user_access() {
+  need_root
+  [[ $# -ge 1 ]] || err "usage: proxyctl user access <username> [--reset-password] [--format generic|telegram|uri]"
+  local user="$1"
+  shift
+  require_user "$user"
+
+  local reset="false"
+  local fmt="generic"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reset-password) reset="true" ;;
+      --format)
+        shift
+        [[ $# -gt 0 ]] || err "--format requires a value"
+        fmt="$1"
+        ;;
+      *) err "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  local host port pass
+  host="$(proxy_host || true)"
+  [[ -n "$host" ]] || host="unknown"
+  port="$(proxy_port)"
+
+  if [[ "$reset" == "true" ]]; then
+    pass="$(random_password)"
+    echo "${user}:${pass}" | chpasswd
+  else
+    pass="$(t password_unknown)"
+  fi
+
+  print_access_data "$user" "$pass" "$host" "$port" "$fmt"
+}
+
+user_lock() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl user lock <username>"
+  require_user "$1"
+  passwd -l "$1"
+}
+
+user_unlock() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl user unlock <username>"
+  require_user "$1"
+  passwd -u "$1"
+}
+
+user_delete() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl user delete <username>"
+  require_user "$1"
+  userdel "$1"
+}
+
+firewall_status() {
+  need_root
+  ufw status verbose
+}
+
+firewall_allow_ip() {
+  need_root
+  [[ $# -ge 1 ]] || err "usage: proxyctl firewall allow-ip <ip-or-cidr> [--port <port>]"
+  local ip="$1"
+  shift
+  local port
+  port="$(proxy_port)"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        shift
+        [[ $# -gt 0 ]] || err "--port requires a value"
+        port="$1"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  port_ok "$port" || err "invalid port: $port"
+  ufw allow from "$ip" to any port "$port" proto tcp
+}
+
+firewall_revoke_ip() {
+  need_root
+  [[ $# -ge 1 ]] || err "usage: proxyctl firewall revoke-ip <ip-or-cidr> [--port <port>]"
+  local ip="$1"
+  shift
+  local port
+  port="$(proxy_port)"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        shift
+        [[ $# -gt 0 ]] || err "--port requires a value"
+        port="$1"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  port_ok "$port" || err "invalid port: $port"
+  ufw delete allow from "$ip" to any port "$port" proto tcp
+}
+
+firewall_open_public() {
+  need_root
+  local port="$(proxy_port)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        shift
+        [[ $# -gt 0 ]] || err "--port requires a value"
+        port="$1"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  port_ok "$port" || err "invalid port: $port"
+  ufw allow "$port"/tcp
+}
+
+firewall_close_public() {
+  need_root
+  local port="$(proxy_port)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        shift
+        [[ $# -gt 0 ]] || err "--port requires a value"
+        port="$1"
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  port_ok "$port" || err "invalid port: $port"
+  ufw delete allow "$port"/tcp
+}
+
+config_show() {
+  need_root
+  cat "$DANTED_CONF"
+}
+
+config_port() {
+  need_root
+  if [[ $# -eq 0 ]]; then
+    echo "$(proxy_port)"
+    return
+  fi
+
+  [[ $# -eq 1 ]] || err "usage: proxyctl config port [<new-port>]"
+  local new_port="$1"
+  port_ok "$new_port" || err "invalid port: $new_port"
+
+  local ts backup
+  ts="$(date +%F-%H%M%S)"
+  backup="${DANTED_CONF}.bak.${ts}"
+  cp "$DANTED_CONF" "$backup"
+
+  sed -i -E "s|^(internal:[[:space:]]+[^[:space:]]+[[:space:]]+port[[:space:]]*=[[:space:]]*)[0-9]+|\\1${new_port}|" "$DANTED_CONF"
+  echo "backup: $backup"
+  echo "new_port: $new_port"
+  echo "Run: sudo proxyctl service restart"
+}
+
+config_backup() {
+  need_root
+  local ts backup
+  ts="$(date +%F-%H%M%S)"
+  backup="${DANTED_CONF}.bak.${ts}"
+  cp "$DANTED_CONF" "$backup"
+  echo "$backup"
+}
+
+config_restore() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl config restore <backup-file>"
+  local file="$1"
+  [[ -f "$file" ]] || err "backup file not found: $file"
+  cp "$file" "$DANTED_CONF"
+  echo "restored from: $file"
+  echo "Run: sudo proxyctl service restart"
+}
+
+lang_show() {
+  load_lang
+  echo "$LANG_CODE"
+}
+
+lang_set() {
+  need_root
+  [[ $# -eq 1 ]] || err "usage: proxyctl lang set <en|ru>"
+  save_lang "$1"
+  echo "$(t lang_changed): $LANG_CODE"
+}
+
+audit() {
+  need_root
+  local since="24 hours ago"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        shift
+        [[ $# -gt 0 ]] || err "--since requires a value"
+        since="$1"
+        ;;
+      -h|--help)
+        print_audit_help
+        return
+        ;;
+      *)
+        err "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  echo "[audit]"
+  echo "window: $since"
+
+  local fail_lines fail_count
+  fail_lines="$(journalctl --since "$since" --no-pager | match_lines "pam_unix\\(danted:auth\\): authentication failure")"
+  if [[ -z "$fail_lines" ]]; then
+    fail_count=0
+  else
+    fail_count="$(printf "%s\n" "$fail_lines" | sed '/^$/d' | wc -l)"
+  fi
+
+  echo
+  echo "[auth_failures]"
+  echo "count: $fail_count"
+  if [[ "$fail_count" -gt 0 ]]; then
+    echo "top_source_ips:"
+    printf "%s\n" "$fail_lines" \
+      | sed -n 's/.*rhost=\([^ ]*\).*/\1/p' \
+      | sort | uniq -c | sort -nr | head -n 10
+  fi
+
+  local success_lines
+  success_lines="$(journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager | match_lines "username%[^@]+@")"
+
+  echo
+  echo "[top_users_success]"
+  if [[ -z "$success_lines" ]]; then
+    echo "no data"
+  else
+    printf "%s\n" "$success_lines" \
+      | sed -n 's/.*username%\([^@ ]*\)@.*/\1/p' \
+      | sort | uniq -c | sort -nr | head -n 10
+  fi
+
+  echo
+  echo "[top_source_ips_success]"
+  if [[ -z "$success_lines" ]]; then
+    echo "no data"
+  else
+    printf "%s\n" "$success_lines" \
+      | sed -n 's/.*username%[^@]*@\([0-9.]*\)\.[0-9][0-9]* .*/\1/p' \
+      | sed '/^$/d' \
+      | sort | uniq -c | sort -nr | head -n 10
+  fi
+
+  local blocked_lines blocked_count
+  blocked_lines="$(journalctl -u "$DANTED_SERVICE" --since "$since" --no-pager | match_lines "block\\([0-9]+\\): tcp/accept .*no rules matched")"
+  if [[ -z "$blocked_lines" ]]; then
+    blocked_count=0
+  else
+    blocked_count="$(printf "%s\n" "$blocked_lines" | sed '/^$/d' | wc -l)"
+  fi
+  echo
+  echo "[blocked_by_rules]"
+  echo "count: $blocked_count"
+  if [[ "$blocked_count" -gt 0 ]]; then
+    echo "top_source_ips:"
+    printf "%s\n" "$blocked_lines" \
+      | perl -ne 'print "$1\n" if /: ([0-9]+(?:\.[0-9]+){3})\.[0-9]+ [0-9]+(?:\.[0-9]+){3}\.[0-9]+: blocked/' \
+      | sed '/^$/d' \
+      | sort | uniq -c | sort -nr | head -n 10
+  fi
+
+  echo
+  echo "[fail2ban]"
+  if systemctl is-active --quiet fail2ban; then
+    echo "status: active"
+    fail2ban-client status danted-auth 2>/dev/null || echo "jail danted-auth not enabled"
+  else
+    echo "status: inactive"
+  fi
+}
+
+doctor() {
+  need_root
+  local port iface udp_range udp_enabled
+  port="$(proxy_port)"
+  iface="$(proxy_internal_iface)"
+  udp_range="$(sed -n 's/^[[:space:]]*udp\.portrange:[[:space:]]*\([0-9-]\+\).*/\1/p' "$DANTED_CONF" | head -n1)"
+  udp_enabled="no"
+  if grep -Eq '^[[:space:]]*command:.*udpassociate' "$DANTED_CONF"; then
+    udp_enabled="yes"
+  fi
+
+  echo "[service]"
+  if systemctl is-active --quiet "$DANTED_SERVICE"; then
+    echo "ok: danted is active"
+  else
+    echo "fail: danted is not active"
+  fi
+
+  echo
+  echo "[listen]"
+  if ss -ltnp | grep -q ":${port}[[:space:]]"; then
+    echo "ok: danted listens on port ${port}"
+    ss -ltnp | awk 'NR==1 {print; next} $0 ~ ":"p"[[:space:]]" {print}' p="$port"
+  else
+    echo "fail: nothing listens on port ${port}"
+  fi
+
+  echo
+  echo "[config]"
+  echo "internal_iface: ${iface}"
+  echo "port: ${port}"
+  echo "udp_associate: ${udp_enabled}"
+  echo "udp_portrange: ${udp_range:-not set}"
+
+  echo
+  echo "[users]"
+  user_list || true
+
+  echo
+  echo "[udp]"
+  if [[ "$udp_enabled" == "yes" ]]; then
+    echo "ok: udpassociate enabled"
+  else
+    echo "fail: udpassociate not enabled"
+  fi
+  if [[ -n "$udp_range" ]]; then
+    local ufw_udp_range
+    ufw_udp_range="${udp_range/-/:}"
+    echo "configured_range: $udp_range"
+    if ufw status | grep -q "$ufw_udp_range/udp"; then
+      echo "ok: ufw allows $ufw_udp_range/udp"
+    else
+      echo "fail: ufw missing $ufw_udp_range/udp"
+    fi
+  else
+    echo "warn: udp.portrange not configured"
+  fi
+
+  echo
+  echo "[ufw]"
+  ufw status | sed -n '1,25p'
+}
+
+# Legacy aliases for backward compatibility
+legacy_alias() {
+  local cmd="$1"
+  shift || true
+
+  case "$cmd" in
+    status) service_status "$@" ;;
+    restart) service_restart "$@" ;;
+    logs) service_logs "$@" ;;
+    connections) service_connections "$@" ;;
+    show-config) config_show "$@" ;;
+    ufw-status) firewall_status "$@" ;;
+
+    list-users) user_list "$@" ;;
+    adopt-user) user_adopt "$@" ;;
+    add-user) user_add "$@" ;;
+    set-password) user_passwd "$@" ;;
+    access) user_access "$@" ;;
+    lock) user_lock "$@" ;;
+    unlock) user_unlock "$@" ;;
+    del-user) user_delete "$@" ;;
+
+    allow-ip) firewall_allow_ip "$@" ;;
+    revoke-ip) firewall_revoke_ip "$@" ;;
+    audit) audit "$@" ;;
+    usage) usage "$@" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+prompt_nonempty() {
+  local label="$1"
+  local val=""
+  while true; do
+    read -r -p "$label: " val
+    [[ -n "$val" ]] && break
+  done
+  echo "$val"
+}
+
+safe_call() {
+  if ! ( "$@" ); then
+    true
+  fi
+}
+
+interactive_user_menu() {
+  while true; do
+    clear
+    ui_header "$(t user_menu)"
+    ui_statusbar
+    ui_section_spacer
+    ui_menu_item 1 "$(t list_users)"
+    ui_menu_item 2 "$(t add_user)"
+    ui_menu_item 3 "$(t adopt_user)"
+    ui_menu_item 4 "$(t change_password)"
+    ui_menu_item 5 "$(t lock_user)"
+    ui_menu_item 6 "$(t unlock_user)"
+    ui_menu_item 7 "$(t delete_user)"
+    ui_menu_item 8 "$(t access_data)"
+    ui_hotkeys_hint
+    ui_prompt "$(t select)"
+    choice="$REPLY"
+    case "$choice" in
+      h|H) run_action print_user_help ;;
+      b|B) return ;;
+      q|Q) echo "$(t bye)"; exit 0 ;;
+      1) run_action user_list ;;
+      2)
+        local u mode p fmt
+        u="$(prompt_nonempty "$(t username)")"
+        read -r -p "$(t random_password_q): " mode
+        read -r -p "$(t format_prompt): " fmt
+        fmt="${fmt:-generic}"
+        if [[ "${mode:-Y}" =~ ^[Nn]$ ]]; then
+          p="$(prompt_nonempty "$(t password)")"
+          run_action user_add "$u" --password "$p" --format "$fmt"
+        else
+          run_action user_add "$u" --random --format "$fmt"
+        fi
+        ;;
+      3)
+        local u
+        u="$(prompt_nonempty "$(t existing_username)")"
+        run_action user_adopt "$u"
+        ;;
+      4)
+        local u mode p
+        u="$(prompt_nonempty "$(t username)")"
+        read -r -p "$(t random_password_q): " mode
+        if [[ "${mode:-Y}" =~ ^[Nn]$ ]]; then
+          p="$(prompt_nonempty "$(t new_password)")"
+          run_action user_passwd "$u" --password "$p"
+        else
+          run_action user_passwd "$u" --random
+        fi
+        ;;
+      5)
+        local u
+        u="$(prompt_nonempty "$(t username)")"
+        run_action user_lock "$u"
+        ;;
+      6)
+        local u
+        u="$(prompt_nonempty "$(t username)")"
+        run_action user_unlock "$u"
+        ;;
+      7)
+        local u confirm
+        u="$(prompt_nonempty "$(t username)")"
+        read -r -p "$(printf "$(t delete_confirm)" "$u"): " confirm
+        [[ "$confirm" == "YES" ]] || { ui_note "$(t cancelled)"; ui_pause; continue; }
+        run_action user_delete "$u"
+        ;;
+      8)
+        local u reset fmt
+        u="$(prompt_nonempty "$(t username)")"
+        read -r -p "$(t reset_password_q): " reset
+        read -r -p "$(t format_prompt): " fmt
+        fmt="${fmt:-generic}"
+        if [[ "${reset:-Y}" =~ ^[Nn]$ ]]; then
+          run_action user_access "$u" --format "$fmt"
+        else
+          run_action user_access "$u" --reset-password --format "$fmt"
+        fi
+        ;;
+      0) return ;;
+      *) ui_note "$(t invalid)"; ui_pause ;;
+    esac
+  done
+}
+
+interactive_firewall_menu() {
+  while true; do
+    clear
+    ui_header "$(t firewall_menu)"
+    ui_statusbar
+    ui_section_spacer
+    ui_menu_item 1 "$(t ufw_status)"
+    ui_menu_item 2 "$(t allow_ip)"
+    ui_menu_item 3 "$(t revoke_ip)"
+    ui_menu_item 4 "$(t open_public)"
+    ui_menu_item 5 "$(t close_public)"
+    ui_hotkeys_hint
+    ui_prompt "$(t select)"
+    choice="$REPLY"
+    case "$choice" in
+      h|H) run_action print_firewall_help ;;
+      b|B) return ;;
+      q|Q) echo "$(t bye)"; exit 0 ;;
+      1) run_action firewall_status ;;
+      2)
+        local ip
+        ip="$(prompt_nonempty "$(t ip_cidr)")"
+        run_action firewall_allow_ip "$ip"
+        ;;
+      3)
+        local ip
+        ip="$(prompt_nonempty "$(t ip_cidr)")"
+        run_action firewall_revoke_ip "$ip"
+        ;;
+      4)
+        local c
+        read -r -p "$(t open_confirm): " c
+        [[ "$c" == "OPEN" ]] || { ui_note "$(t cancelled)"; ui_pause; continue; }
+        run_action firewall_open_public
+        ;;
+      5) run_action firewall_close_public ;;
+      0) return ;;
+      *) ui_note "$(t invalid)"; ui_pause ;;
+    esac
+  done
+}
+
+interactive_config_menu() {
+  while true; do
+    clear
+    ui_header "$(t config_menu)"
+    ui_statusbar
+    ui_section_spacer
+    ui_menu_item 1 "$(t show_config)"
+    ui_menu_item 2 "$(t show_port)"
+    ui_menu_item 3 "$(t change_port)"
+    ui_menu_item 4 "$(t backup_config)"
+    ui_menu_item 5 "$(t restore_config)"
+    ui_hotkeys_hint
+    ui_prompt "$(t select)"
+    choice="$REPLY"
+    case "$choice" in
+      h|H) run_action print_config_help ;;
+      b|B) return ;;
+      q|Q) echo "$(t bye)"; exit 0 ;;
+      1) run_action config_show ;;
+      2) run_action config_port ;;
+      3)
+        local p
+        p="$(prompt_nonempty "$(t new_port)")"
+        run_action config_port "$p"
+        ;;
+      4) run_action config_backup ;;
+      5)
+        local f
+        f="$(prompt_nonempty "$(t backup_path)")"
+        run_action config_restore "$f"
+        ;;
+      0) return ;;
+      *) ui_note "$(t invalid)"; ui_pause ;;
+    esac
+  done
+}
+
+interactive_main() {
+  need_root
+  while true; do
+    clear
+    ui_header "$(t main_menu)"
+    ui_statusbar
+    ui_section_spacer
+    ui_menu_item 1 "$(t health_check)"
+    ui_menu_item 2 "$(t service_status)"
+    ui_menu_item 3 "$(t service_restart)"
+    ui_menu_item 4 "$(t live_logs)"
+    ui_menu_item 5 "$(t active_connections)"
+    ui_menu_item 6 "$(t user_management)"
+    ui_menu_item 7 "$(t firewall_management)"
+    ui_menu_item 8 "$(t config_management)"
+    ui_menu_item 9 "$(t help)"
+    ui_menu_item 10 "$(t language)"
+    ui_menu_item 11 "$(t audit)"
+    ui_menu_item 12 "$(t usage)"
+    ui_menu_item 13 "$(t quota)"
+    ui_hotkeys_hint
+    ui_prompt "$(t select)"
+    choice="$REPLY"
+    case "$choice" in
+      h|H) print_main_help; ui_pause ;;
+      q|Q) echo "$(t bye)"; return ;;
+      1) run_action doctor ;;
+      2) run_action service_status ;;
+      3) run_action service_restart ;;
+      4) run_action service_logs --follow ;;
+      5) run_action service_connections ;;
+      6) interactive_user_menu ;;
+      7) interactive_firewall_menu ;;
+      8) interactive_config_menu ;;
+      9) print_main_help; ui_pause ;;
+      10)
+        echo "$(t lang_now): $(lang_show)"
+        local l
+        read -r -p "$(t lang_set_prompt): " l
+        if [[ "$l" == "ru" || "$l" == "en" ]]; then
+          save_lang "$l"
+          echo "$(t lang_changed): $LANG_CODE"
+        else
+          echo "$(t invalid)"
+        fi
+        ui_pause
+        ;;
+      11) run_action audit ;;
+      12) run_action usage ;;
+      13) run_action quota_list ;;
+      0) echo "$(t bye)"; return ;;
+      *) ui_note "$(t invalid)"; ui_pause ;;
+    esac
+  done
+}
+
+main() {
+  ui_init
+  load_lang
+
+  if [[ $# -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      interactive_main
+    else
+      print_main_help
+    fi
+    return
+  fi
+
+  local group="$1"
+  shift
+
+  if legacy_alias "$group" "$@"; then
+    return
+  fi
+
+  case "$group" in
+    help|-h|--help)
+      print_main_help
+      ;;
+
+    service)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_service_help ;;
+        status) service_status "$@" ;;
+        restart) service_restart "$@" ;;
+        logs) service_logs "$@" ;;
+        connections) service_connections "$@" ;;
+        *) err "unknown service command: $cmd" ;;
+      esac
+      ;;
+
+    user)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_user_help ;;
+        list) user_list "$@" ;;
+        adopt) user_adopt "$@" ;;
+        add) user_add "$@" ;;
+        passwd) user_passwd "$@" ;;
+        access) user_access "$@" ;;
+        lock) user_lock "$@" ;;
+        unlock) user_unlock "$@" ;;
+        delete) user_delete "$@" ;;
+        *) err "unknown user command: $cmd" ;;
+      esac
+      ;;
+
+    firewall)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_firewall_help ;;
+        status) firewall_status "$@" ;;
+        allow-ip) firewall_allow_ip "$@" ;;
+        revoke-ip) firewall_revoke_ip "$@" ;;
+        open-public) firewall_open_public "$@" ;;
+        close-public) firewall_close_public "$@" ;;
+        *) err "unknown firewall command: $cmd" ;;
+      esac
+      ;;
+
+    config)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_config_help ;;
+        show) config_show "$@" ;;
+        port) config_port "$@" ;;
+        backup) config_backup "$@" ;;
+        restore) config_restore "$@" ;;
+        *) err "unknown config command: $cmd" ;;
+      esac
+      ;;
+
+    lang)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_lang_help ;;
+        show) lang_show "$@" ;;
+        set) lang_set "$@" ;;
+        *) err "unknown lang command: $cmd" ;;
+      esac
+      ;;
+
+    audit)
+      audit "$@"
+      ;;
+
+    usage)
+      usage "$@"
+      ;;
+
+    quota)
+      local cmd="${1:-help}"
+      shift || true
+      case "$cmd" in
+        help|-h|--help) print_quota_help ;;
+        list) quota_list "$@" ;;
+        set) quota_set "$@" ;;
+        del|delete|rm) quota_del "$@" ;;
+        enforce) quota_enforce "$@" ;;
+        *) err "unknown quota command: $cmd" ;;
+      esac
+      ;;
+
+    doctor)
+      doctor "$@"
+      ;;
+
+    *)
+      err "unknown command group: $group (run: proxyctl help)"
+      ;;
+  esac
+}
+
+main "$@"
